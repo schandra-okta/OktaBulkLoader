@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration scan="false">
+
+    <appender name="stdout" class="ch.qos.logback.core.ConsoleAppender">
+        <Target>System.out</Target>
+        <encoder>
+            <pattern>[ %date{dd-MM-yyyy HH:mm:ss.SSS} ] [ %thread ] [%logger{0}] [%level] - %message%n</pattern>
+        </encoder>
+    </appender>
+
+    <appender name="logfile" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <File>ldapbridge.log</File>
+        <encoder>
+            <pattern>[ %date{dd-MM-yyyy HH:mm:ss.SSS} ] [ %thread ] [%logger{0}] [%level] - %message%n</pattern>
+        </encoder>
+        <rollingPolicy class="ch.qos.logback.core.rolling.FixedWindowRollingPolicy">
+            <maxIndex>50</maxIndex>
+            <FileNamePattern>logs/bulkload.log.%i</FileNamePattern>
+        </rollingPolicy>
+        <triggeringPolicy class="ch.qos.logback.core.rolling.SizeBasedTriggeringPolicy">
+            <maxFileSize>20MB</maxFileSize>
+        </triggeringPolicy>
+    </appender>
+
+    <logger name="com.okta" level="ERROR"/>
+
+    <root level="ERROR">
+        <appender-ref ref="logfile"/>
+        <appender-ref ref="stdout"/>
+    </root>
+</configuration>
