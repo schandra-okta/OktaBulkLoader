@@ -34,7 +34,7 @@ public class BulkLoader {
         {
             System.out.println(new Date() + " : **ERROR** : Missing configuration file argument");
             System.out.println("Run using following command : ");
-            System.out.println("java -jar bulk_load.jar <config_file>");
+            System.out.println("java -jar okta-bulkload.jar <config_file>");
             System.exit(-1);
         }
         try{
