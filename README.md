@@ -25,4 +25,4 @@ Steps:
 
 5. Using the jar file that is created in the target directory, start up the application
 
-	$> java -jar target/okta-bulkload.jar
+	$> java -jar target/okta-bulkload.jar <path_to_config_file>
