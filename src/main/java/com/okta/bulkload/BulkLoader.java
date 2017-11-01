@@ -103,7 +103,7 @@ class Producer implements Runnable {
             //initialize the CSVParser object
             CSVParser parser = new CSVParser(new FileReader(csvFile), format);
             for(CSVRecord record : parser)           
-                queue.add(record);
+                queue.put(record);
             parser.close();
         } catch (Exception excp) { 
             System.out.println(excp.getLocalizedMessage());
