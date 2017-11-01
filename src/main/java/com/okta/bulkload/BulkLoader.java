@@ -1,8 +1,10 @@
 package com.okta.bulkload;
 
+import static com.okta.bulkload.BulkLoader.*;
+
 import java.io.*;
 import java.util.*;
-import java.io.FileReader;
+import java.util.concurrent.*;
 
 import org.apache.commons.csv.CSVFormat;
 import org.apache.commons.csv.CSVParser;
@@ -25,10 +27,15 @@ import org.apache.http.util.EntityUtils;
 
 public class BulkLoader {
     final static Properties configuration = new Properties();
+    protected static volatile int successCount = 0, errorCount = 0;
+    protected static CSVPrinter errorRecordPrinter;
+    protected static volatile boolean noMoreRecordsBeingAdded = false;
+    protected static volatile boolean errorHeaderWritten = false;
 
     public static void main(String args[]) throws Exception{
         System.out.println("Start : "+new Date());
         System.out.println();
+        long startTime = System.currentTimeMillis();
         
         if (args.length == 0)
         {
@@ -43,75 +50,149 @@ public class BulkLoader {
         catch(Exception e){
             //TODO: Log
         }
-        String org = configuration.getProperty("org");
-        String apiToken = configuration.getProperty("apiToken");
-        String csvFile = configuration.getProperty("csvFile");
         String errorFile = configuration.getProperty("errorFile");
-        String csvHeaderRow = configuration.getProperty("csvHeaderRow");
-        String[] csvHeaders = csvHeaderRow.split(",");
-        String csvLoginField = configuration.getProperty("csvLoginField");
+        int numConsumers = Integer.parseInt(configuration.getProperty("numConsumers", "1"));
+        int bufferSize = Integer.parseInt(configuration.getProperty("bufferSize", "10000"));
         
-        int successCount = 0, errorCount = 0;
-        CSVFormat format = CSVFormat.RFC4180.withHeader().withDelimiter(',');
-		
-		//initialize the CSVParser object
-		CSVParser parser = new CSVParser(new FileReader(csvFile), format);
-        CSVPrinter errorRecordPrinter = new CSVPrinter(new FileWriter(errorFile),format);
+        CSVFormat errorFormat = CSVFormat.RFC4180.withDelimiter(',');		
+        errorRecordPrinter = new CSVPrinter(new FileWriter(errorFile),errorFormat);
         
-        for(CSVRecord record : parser){
-            JSONObject user = new JSONObject();
-            JSONObject creds = new JSONObject();
-            JSONObject profile = new JSONObject();
-            
-            //Add username
-            profile.put("login", record.get(csvLoginField));
-            //Flesh out rest of profile
-            for (String headerColumn:csvHeaders)
-                profile.put(configuration.getProperty("csvHeader."+headerColumn),record.get(headerColumn));
-            
-            creds.put("password", new JSONObject("{\"value\": \""+RandomStringUtils.randomAlphabetic(8)+"\"}"));
-            
-            user.put("profile", profile);
-            user.put("credentials", creds);
-            // Submit to Okta via CSV import endpoint
-            CloseableHttpClient httpclient = HttpClients.createDefault();
+        BlockingQueue myQueue = new LinkedBlockingQueue(bufferSize);
+        
+        Producer csvReadWorker = new Producer(myQueue);
+        Thread producer = new Thread(csvReadWorker);
+        producer.start();
+        Thread.sleep(500);//Give the queue time to fill up
+        
+        Thread[] consumers = new Thread[numConsumers];
+        for (int i = 0; i < numConsumers; i++){
+            Consumer worker = new Consumer(myQueue);
+            consumers[i] = new Thread(worker);
+            consumers[i].start();
+        }
+        
+        producer.join();
+        for (int i = 0; i < numConsumers; i++)
+            consumers[i].join();
 
-            // Build JSON payload
-            StringEntity data = new StringEntity(user.toString(),ContentType.APPLICATION_JSON);
-            
-            // build http request and assign payload data
-            HttpUriRequest request = RequestBuilder
-                    .post("https://"+org+"/api/v1/users")
-                    .setHeader("Authorization", "SSWS " + apiToken)
-                    .setEntity(data)
-                    .build();
-            HttpResponse httpResponse = httpclient.execute(request);
-            
-            if (httpResponse.getStatusLine().getStatusCode() != 200){
-                JSONObject errorJSON = new JSONObject(EntityUtils.toString(httpResponse.getEntity()));
-                String errorCode = errorJSON.getString("errorCode");
-                String errorCause = errorJSON.getJSONArray("errorCauses").getJSONObject(0).getString("errorSummary");
-                Map values = record.toMap();
-                values.put("errorCode", errorCode);
-                values.put("errorCause", errorCause);
-                if (errorCount==0)
-                    errorRecordPrinter.printRecord(values.keySet());
-                errorRecordPrinter.printRecord(values.values());//Got an error for this row - write it to error file
-                System.err.flush();
-                errorCount++;
-            }
-            else
-                successCount++;
-            if (successCount!=0 && successCount%10==0)System.out.print(".");
-		}
-		//close the parser and errorPrinter
-		parser.close();
+		//close the errorPrinter
         errorRecordPrinter.close();
-
+        
         System.out.println();
         System.out.println("Successfully added "+successCount+" user(s)");
-        System.out.println("Error in processing "+errorCount+" user(s)"+(errorCount>0?". Failed rows in Errors.csv":""));
+        System.out.println("Error in processing "+errorCount+" user(s)"+(errorCount>0?". Failed rows in error file configured.":""));
         System.out.println();
-        System.out.println("Done : "+new Date());        
+        System.out.println("Done : "+new Date());
+        long endTime = System.currentTimeMillis();
+        long duration = (endTime - startTime)/1000;
+        System.out.println("Total time taken = "+duration+" seconds");
+    }
+}
+
+class Producer implements Runnable {
+    private final BlockingQueue queue;
+    private final String csvFile;
+    private final CSVFormat format;
+    Producer(BlockingQueue q) { 
+        queue = q; 
+        csvFile = configuration.getProperty("csvFile");
+        format = CSVFormat.RFC4180.withHeader().withDelimiter(',');        
+    }
+    public void run() {
+        try {
+            //initialize the CSVParser object
+            CSVParser parser = new CSVParser(new FileReader(csvFile), format);
+            for(CSVRecord record : parser)           
+                queue.add(record);
+            parser.close();
+        } catch (Exception excp) { 
+            System.out.println(excp.getLocalizedMessage());
+        } finally {
+            noMoreRecordsBeingAdded = true;
+        }
+    }
+}
+   
+ class Consumer implements Runnable {
+    private final BlockingQueue queue;
+    private final String org;
+    private final String apiToken;
+    private final String csvHeaderRow;
+    private final String[] csvHeaders;
+    private final String csvLoginField;
+    Consumer(BlockingQueue q) { 
+        queue = q; 
+        org = configuration.getProperty("org");
+        apiToken = configuration.getProperty("apiToken");
+        csvHeaderRow = configuration.getProperty("csvHeaderRow");
+        csvHeaders = csvHeaderRow.split(",");
+        csvLoginField = configuration.getProperty("csvLoginField");
+    }
+    public void run() {
+      try {
+        while (true) { 
+            if (noMoreRecordsBeingAdded && queue.isEmpty())
+                Thread.currentThread().interrupt();
+            consume(queue.take());
+        }
+      } catch (InterruptedException ex) { 
+          System.out.println("Finished processing for this thread");
+      } catch (Exception excp) { 
+          System.out.println(excp.getLocalizedMessage());
+      }     
+    }
+   
+    void consume(Object record) throws Exception{
+        CSVRecord csvRecord = (CSVRecord)record;
+        JSONObject user = new JSONObject();
+        JSONObject creds = new JSONObject();
+        JSONObject profile = new JSONObject();
+
+        //Add username
+        profile.put("login", csvRecord.get(csvLoginField));
+        //Flesh out rest of profile
+        for (String headerColumn:csvHeaders)
+            profile.put(configuration.getProperty("csvHeader."+headerColumn),csvRecord.get(headerColumn));
+
+        creds.put("password", new JSONObject("{\"value\": \""+RandomStringUtils.randomAlphabetic(8)+"\"}"));
+
+        user.put("profile", profile);
+        user.put("credentials", creds);
+        CloseableHttpClient httpclient = HttpClients.createDefault();
+
+        // Build JSON payload
+        StringEntity data = new StringEntity(user.toString(),ContentType.APPLICATION_JSON);
+
+        // build http request and assign payload data
+        HttpUriRequest request = RequestBuilder
+                .post("https://"+org+"/api/v1/users")
+                .setHeader("Authorization", "SSWS " + apiToken)
+                .setEntity(data)
+                .build();
+        HttpResponse httpResponse = httpclient.execute(request);
+
+        if (httpResponse.getStatusLine().getStatusCode() != 200){
+            JSONObject errorJSON = new JSONObject(EntityUtils.toString(httpResponse.getEntity()));
+            String errorCode = errorJSON.getString("errorCode");
+            String errorCause = errorJSON.getJSONArray("errorCauses").getJSONObject(0).getString("errorSummary");
+            Map values = csvRecord.toMap();
+            values.put("errorCode", errorCode);
+            values.put("errorCause", errorCause);
+            if (!errorHeaderWritten){
+                synchronized(errorRecordPrinter){
+                    if(!errorHeaderWritten){
+                        errorRecordPrinter.printRecord(values.keySet());
+                        errorHeaderWritten = true;
+                    }
+                }
+            }
+            synchronized(errorRecordPrinter){
+                errorRecordPrinter.printRecord(values.values());//Got an error for this row - write it to error file
+            }
+            errorCount++;
+        }
+        else
+            successCount++;
+        if (successCount!=0 && successCount%10==0)System.out.print(".");
     }
 }
