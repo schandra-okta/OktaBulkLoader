@@ -5,6 +5,7 @@ import static com.okta.bulkload.BulkLoader.*;
 import java.io.*;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import org.apache.commons.csv.CSVFormat;
 import org.apache.commons.csv.CSVParser;
@@ -14,11 +15,12 @@ import org.apache.commons.csv.CSVRecord;
 import org.apache.commons.lang.RandomStringUtils;
 import org.apache.http.entity.ContentType;
 import org.apache.http.entity.StringEntity;
-import org.apache.http.HttpResponse;
+import org.apache.http.client.methods.CloseableHttpResponse;
 import org.apache.http.client.methods.HttpUriRequest;
 import org.apache.http.client.methods.RequestBuilder;
 import org.apache.http.impl.client.CloseableHttpClient;
-import org.apache.http.impl.client.HttpClients;
+import org.apache.http.impl.client.DefaultHttpRequestRetryHandler;
+import org.apache.http.impl.client.HttpClientBuilder;
 import org.apache.http.util.EntityUtils;
 /**
  *
@@ -27,7 +29,7 @@ import org.apache.http.util.EntityUtils;
 
 public class BulkLoader {
     final static Properties configuration = new Properties();
-    protected static volatile int successCount = 0, errorCount = 0;
+    protected static AtomicInteger successCount = new AtomicInteger(0), errorCount = new AtomicInteger(0);
     protected static CSVPrinter errorRecordPrinter;
     protected static volatile boolean noMoreRecordsBeingAdded = false;
     protected static volatile boolean errorHeaderWritten = false;
@@ -80,7 +82,7 @@ public class BulkLoader {
         
         System.out.println();
         System.out.println("Successfully added "+successCount+" user(s)");
-        System.out.println("Error in processing "+errorCount+" user(s)"+(errorCount>0?". Failed rows in error file configured.":""));
+        System.out.println("Error in processing "+errorCount+" user(s)"+(errorCount.get()>0?". Failed rows in error file configured.":""));
         System.out.println();
         System.out.println("Done : "+new Date());
         long endTime = System.currentTimeMillis();
@@ -120,6 +122,7 @@ class Producer implements Runnable {
     private final String csvHeaderRow;
     private final String[] csvHeaders;
     private final String csvLoginField;
+    private final CloseableHttpClient httpclient;
     Consumer(BlockingQueue q) { 
         queue = q; 
         org = configuration.getProperty("org");
@@ -127,6 +130,7 @@ class Producer implements Runnable {
         csvHeaderRow = configuration.getProperty("csvHeaderRow");
         csvHeaders = csvHeaderRow.split(",");
         csvLoginField = configuration.getProperty("csvLoginField");
+        httpclient = HttpClientBuilder.create().setRetryHandler(new DefaultHttpRequestRetryHandler(3, false)).build();
     }
     public void run() {
       try {
@@ -136,9 +140,9 @@ class Producer implements Runnable {
             consume(queue.take());
         }
       } catch (InterruptedException ex) { 
-          System.out.println("Finished processing for this thread");
+          //System.out.println("Finished processing for this thread");
       } catch (Exception excp) { 
-          System.out.println(excp.getLocalizedMessage());
+          System.out.println(excp.getLocalizedMessage());//This consumer thread will abort execution
       }     
     }
    
@@ -158,7 +162,6 @@ class Producer implements Runnable {
 
         user.put("profile", profile);
         user.put("credentials", creds);
-        CloseableHttpClient httpclient = HttpClients.createDefault();
 
         // Build JSON payload
         StringEntity data = new StringEntity(user.toString(),ContentType.APPLICATION_JSON);
@@ -169,15 +172,46 @@ class Producer implements Runnable {
                 .setHeader("Authorization", "SSWS " + apiToken)
                 .setEntity(data)
                 .build();
-        HttpResponse httpResponse = httpclient.execute(request);
+        CloseableHttpResponse httpResponse = null;
+        try{
+            httpResponse = httpclient.execute(request);
 
-        if (httpResponse.getStatusLine().getStatusCode() != 200){
-            JSONObject errorJSON = new JSONObject(EntityUtils.toString(httpResponse.getEntity()));
-            String errorCode = errorJSON.getString("errorCode");
-            String errorCause = errorJSON.getJSONArray("errorCauses").getJSONObject(0).getString("errorSummary");
-            Map values = csvRecord.toMap();
-            values.put("errorCode", errorCode);
-            values.put("errorCause", errorCause);
+            //Rate limit exceeded, hold off processing for this thread till the limit is reset
+            if (httpResponse.getStatusLine().getStatusCode() == 429){
+               queue.put(record);
+               long limitResetsAt = Long.parseLong(httpResponse.getFirstHeader("x-rate-limit-reset").getValue());
+               long timeToSleep = limitResetsAt - (System.currentTimeMillis()/1000) + 10;
+               //System.out.println("Going to sleep for "+timeToSleep+" seconds...");
+               Thread.sleep(timeToSleep*1000);
+            }
+            else if (httpResponse.getStatusLine().getStatusCode() != 200){
+                JSONObject errorJSON = new JSONObject(EntityUtils.toString(httpResponse.getEntity()));
+                String errorCode = errorJSON.getString("errorCode");
+                String errorCause = errorJSON.getJSONArray("errorCauses").getJSONObject(0).getString("errorSummary");
+                Map values = csvRecord.toMap();
+                values.put("errorCode", errorCode);
+                values.put("errorCause", errorCause);
+                if (!errorHeaderWritten){
+                    synchronized(errorRecordPrinter){
+                        if(!errorHeaderWritten){
+                            errorRecordPrinter.printRecord(values.keySet());
+                            errorHeaderWritten = true;
+                        }
+                    }
+                }
+                synchronized(errorRecordPrinter){
+                    errorRecordPrinter.printRecord(values.values());//Got an error for this row - write it to error file
+                }
+                errorCount.getAndIncrement();
+            }
+            else
+                    successCount.getAndIncrement();
+            if (successCount.get()!=0 && successCount.get()%100==0)System.out.print(".");
+        }
+        catch(Exception e){
+        	Map values = csvRecord.toMap();
+            values.put("errorCode", "E000001");
+            values.put("errorCause", e.getLocalizedMessage());
             if (!errorHeaderWritten){
                 synchronized(errorRecordPrinter){
                     if(!errorHeaderWritten){
@@ -189,10 +223,11 @@ class Producer implements Runnable {
             synchronized(errorRecordPrinter){
                 errorRecordPrinter.printRecord(values.values());//Got an error for this row - write it to error file
             }
-            errorCount++;
+        	
         }
-        else
-            successCount++;
-        if (successCount!=0 && successCount%10==0)System.out.print(".");
+        finally{
+            if (null != httpResponse)
+                httpResponse.close();
+        }
     }
 }
