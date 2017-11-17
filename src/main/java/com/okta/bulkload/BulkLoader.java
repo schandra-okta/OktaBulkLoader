@@ -85,7 +85,7 @@ public class BulkLoader {
         
         System.out.println();
         System.out.println("Successfully added "+successCount+" user(s)");
-        System.out.println("Error in processing "+errorCount+" user(s)"+(errorCount.get()>0?". Failed rows in error file configured.":""));
+        System.out.println("Error in processing "+errorCount+" user(s)");
         System.out.println();
         System.out.println("Done : "+new Date());
         long endTime = System.currentTimeMillis();
