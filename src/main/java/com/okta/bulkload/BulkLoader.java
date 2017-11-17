@@ -7,11 +7,7 @@ import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 
-import org.apache.commons.csv.CSVFormat;
-import org.apache.commons.csv.CSVParser;
-import org.apache.commons.csv.CSVPrinter;
-import org.apache.commons.csv.CSVRecord;
-
+import org.apache.commons.csv.*;
 import org.apache.commons.lang.RandomStringUtils;
 import org.apache.http.entity.ContentType;
 import org.apache.http.entity.StringEntity;
@@ -33,30 +29,35 @@ public class BulkLoader {
     protected static CSVPrinter errorRecordPrinter;
     protected static volatile boolean noMoreRecordsBeingAdded = false;
     protected static volatile boolean errorHeaderWritten = false;
+    protected static String[] errorHeaders = null;
+    protected static String csvFileArg = null;
 
     public static void main(String args[]) throws Exception{
         System.out.println("Start : "+new Date());
         System.out.println();
         long startTime = System.currentTimeMillis();
         
-        if (args.length == 0)
+        if (args.length < 2)
         {
             System.out.println(new Date() + " : **ERROR** : Missing configuration file argument");
             System.out.println("Run using following command : ");
-            System.out.println("java -jar okta-bulkload.jar <config_file>");
+            System.out.println("java -jar bulk_load.jar <config_file> <csv_file_location>");
             System.exit(-1);
         }
         try{
             configuration.load(new FileInputStream(args[0]));
+            csvFileArg = args[1];
         }
         catch(Exception e){
-            //TODO: Log
+            System.out.println("Error reading configuration. Exiting...");
+            System.exit(-1);
         }
-        String errorFile = configuration.getProperty("errorFile");
+        String errorFile = csvFileArg+"_ERROR_"+System.currentTimeMillis()+".csv";
+        errorHeaders = (configuration.getProperty("csvHeaderRow")+",errorCode,errorCause").split(",");
         int numConsumers = Integer.parseInt(configuration.getProperty("numConsumers", "1"));
         int bufferSize = Integer.parseInt(configuration.getProperty("bufferSize", "10000"));
         
-        CSVFormat errorFormat = CSVFormat.RFC4180.withDelimiter(',');		
+        CSVFormat errorFormat = CSVFormat.RFC4180.withDelimiter(',').withQuote('"').withQuoteMode(QuoteMode.ALL).withHeader(errorHeaders);		
         errorRecordPrinter = new CSVPrinter(new FileWriter(errorFile),errorFormat);
         
         BlockingQueue myQueue = new LinkedBlockingQueue(bufferSize);
@@ -93,17 +94,15 @@ public class BulkLoader {
 
 class Producer implements Runnable {
     private final BlockingQueue queue;
-    private final String csvFile;
     private final CSVFormat format;
     Producer(BlockingQueue q) { 
         queue = q; 
-        csvFile = configuration.getProperty("csvFile");
         format = CSVFormat.RFC4180.withHeader().withDelimiter(',');        
     }
     public void run() {
         try {
             //initialize the CSVParser object
-            CSVParser parser = new CSVParser(new FileReader(csvFile), format);
+            CSVParser parser = new CSVParser(new FileReader(csvFileArg), format);
             for(CSVRecord record : parser)           
                 queue.put(record);
             parser.close();
@@ -175,59 +174,50 @@ class Producer implements Runnable {
         CloseableHttpResponse httpResponse = null;
         try{
             httpResponse = httpclient.execute(request);
-
+            int responseCode = httpResponse.getStatusLine().getStatusCode();
+            
             //Rate limit exceeded, hold off processing for this thread till the limit is reset
-            if (httpResponse.getStatusLine().getStatusCode() == 429){
+            if (responseCode == 429){//Retry after appropriate time
                queue.put(record);
                long limitResetsAt = Long.parseLong(httpResponse.getFirstHeader("x-rate-limit-reset").getValue());
-               long timeToSleep = limitResetsAt - (System.currentTimeMillis()/1000) + 10;
-               //System.out.println("Going to sleep for "+timeToSleep+" seconds...");
+               httpResponse.close();//Don't put off closing the response
+               //Put this thread to sleep for at least 10 seconds
+               long timeToSleep = Math.abs(limitResetsAt - (System.currentTimeMillis()/1000)) + 10;
                Thread.sleep(timeToSleep*1000);
             }
-            else if (httpResponse.getStatusLine().getStatusCode() != 200){
-                JSONObject errorJSON = new JSONObject(EntityUtils.toString(httpResponse.getEntity()));
-                String errorCode = errorJSON.getString("errorCode");
-                String errorCause = errorJSON.getJSONArray("errorCauses").getJSONObject(0).getString("errorSummary");
-                Map values = csvRecord.toMap();
-                values.put("errorCode", errorCode);
-                values.put("errorCause", errorCause);
-                if (!errorHeaderWritten){
-                    synchronized(errorRecordPrinter){
-                        if(!errorHeaderWritten){
-                            errorRecordPrinter.printRecord(values.keySet());
-                            errorHeaderWritten = true;
-                        }
-                    }
-                }
-                synchronized(errorRecordPrinter){
-                    errorRecordPrinter.printRecord(values.values());//Got an error for this row - write it to error file
-                }
-                errorCount.getAndIncrement();
+            else if (responseCode != 200){//Non-success
+                handleErrorResponse(responseCode, httpResponse, csvRecord, "");
             }
             else
-                    successCount.getAndIncrement();
+                successCount.getAndIncrement();
             if (successCount.get()!=0 && successCount.get()%100==0)System.out.print(".");
-        }
-        catch(Exception e){
-        	Map values = csvRecord.toMap();
-            values.put("errorCode", "E000001");
-            values.put("errorCause", e.getLocalizedMessage());
-            if (!errorHeaderWritten){
-                synchronized(errorRecordPrinter){
-                    if(!errorHeaderWritten){
-                        errorRecordPrinter.printRecord(values.keySet());
-                        errorHeaderWritten = true;
-                    }
-                }
-            }
-            synchronized(errorRecordPrinter){
-                errorRecordPrinter.printRecord(values.values());//Got an error for this row - write it to error file
-            }
-        	
-        }
-        finally{
+        } catch(Exception e){//Issue with the connection. Let's not lose the consumer thread
+            handleErrorResponse(400, httpResponse, csvRecord, e.getLocalizedMessage());
+        }finally{
             if (null != httpResponse)
                 httpResponse.close();
         }
+    }
+    
+    void handleErrorResponse(int responseCode, CloseableHttpResponse response, CSVRecord csvRecord, String exceptionMessage)throws IOException{
+        String errorCode, errorCause;
+        try{
+            JSONObject errorJSON = new JSONObject(EntityUtils.toString(response.getEntity()));
+            errorCode = errorJSON.getString("errorCode");
+            errorCause = errorJSON.getJSONArray("errorCauses").getJSONObject(0).getString("errorSummary");
+        }catch (Exception e){
+            //Can't get error details out of JSON. Assume error that did not result from data
+            errorCode = "HTTP Response code : "+responseCode;
+            errorCause = exceptionMessage;
+        }
+        Map values = csvRecord.toMap();
+        values.put("errorCode", errorCode);
+        values.put("errorCause", errorCause);
+        synchronized(errorRecordPrinter){
+            for (String header : errorHeaders)
+                errorRecordPrinter.print(values.get(header));//Got an error for this row - write it to error file
+            errorRecordPrinter.println();
+        }
+        errorCount.getAndIncrement();
     }
 }
