@@ -220,6 +220,7 @@ class Producer implements Runnable {
                 for (String header : errorHeaders)
                     rateLimitFailurePrinter.print(values.get(header));//Got an error for this row - write it to error file
                 rateLimitFailurePrinter.println();
+                rateLimitFailurePrinter.flush();
             }
         }
         else{
@@ -227,6 +228,7 @@ class Producer implements Runnable {
                 for (String header : errorHeaders)
                     errorRecordPrinter.print(values.get(header));//Got an error for this row - write it to error file
                 errorRecordPrinter.println();
+                errorRecordPrinter.flush();
             }
         }
         errorCount.getAndIncrement();
