@@ -26,7 +26,7 @@ import org.apache.http.util.EntityUtils;
 public class BulkLoader {
     final static Properties configuration = new Properties();
     protected static AtomicInteger successCount = new AtomicInteger(0), errorCount = new AtomicInteger(0);
-    protected static CSVPrinter errorRecordPrinter;
+    protected static CSVPrinter errorRecordPrinter, rateLimitFailurePrinter;
     protected static volatile boolean noMoreRecordsBeingAdded = false;
     protected static volatile boolean errorHeaderWritten = false;
     protected static String[] errorHeaders = null;
@@ -52,13 +52,15 @@ public class BulkLoader {
             System.out.println("Error reading configuration. Exiting...");
             System.exit(-1);
         }
-        String errorFile = csvFileArg+"_ERROR_"+System.currentTimeMillis()+".csv";
+        String errorFile = csvFileArg+"_ERRORS_"+System.currentTimeMillis()+".csv";
+        String rateLimitFile = csvFileArg+"_RATELIMIT_ERRORS_"+System.currentTimeMillis()+".csv";
         errorHeaders = (configuration.getProperty("csvHeaderRow")+",errorCode,errorCause").split(",");
         int numConsumers = Integer.parseInt(configuration.getProperty("numConsumers", "1"));
         int bufferSize = Integer.parseInt(configuration.getProperty("bufferSize", "10000"));
         
-        CSVFormat errorFormat = CSVFormat.RFC4180.withDelimiter(',').withQuote('"').withQuoteMode(QuoteMode.ALL).withHeader(errorHeaders);		
+        CSVFormat errorFormat = CSVFormat.RFC4180.withDelimiter(',').withQuote('"').withQuoteMode(QuoteMode.ALL).withHeader(errorHeaders);        
         errorRecordPrinter = new CSVPrinter(new FileWriter(errorFile),errorFormat);
+        rateLimitFailurePrinter = new CSVPrinter(new FileWriter(rateLimitFile),errorFormat);
         
         BlockingQueue myQueue = new LinkedBlockingQueue(bufferSize);
         
@@ -78,7 +80,7 @@ public class BulkLoader {
         for (int i = 0; i < numConsumers; i++)
             consumers[i].join();
 
-		//close the errorPrinter
+        //close the errorPrinter
         errorRecordPrinter.close();
         
         System.out.println();
@@ -132,17 +134,17 @@ class Producer implements Runnable {
         httpclient = HttpClientBuilder.create().setRetryHandler(new DefaultHttpRequestRetryHandler(3, false)).build();
     }
     public void run() {
-      try {
-        while (true) { 
-            if (noMoreRecordsBeingAdded && queue.isEmpty())
-                Thread.currentThread().interrupt();
-            consume(queue.take());
-        }
-      } catch (InterruptedException ex) { 
-          //System.out.println("Finished processing for this thread");
-      } catch (Exception excp) { 
-          System.out.println(excp.getLocalizedMessage());//This consumer thread will abort execution
-      }     
+        try {
+            while (true) { 
+                if (noMoreRecordsBeingAdded && queue.isEmpty())
+                    Thread.currentThread().interrupt();
+                consume(queue.take());
+            }
+        } catch (InterruptedException ex) { 
+            //System.out.println("Finished processing for this thread");
+        } catch (Exception excp) { 
+            System.out.println(excp.getLocalizedMessage());//This consumer thread will abort execution
+        }     
     }
    
     void consume(Object record) throws Exception{
@@ -178,28 +180,27 @@ class Producer implements Runnable {
             
             //Rate limit exceeded, hold off processing for this thread till the limit is reset
             if (responseCode == 429){//Retry after appropriate time
-               queue.put(record);
-               long limitResetsAt = Long.parseLong(httpResponse.getFirstHeader("x-rate-limit-reset").getValue());
-               httpResponse.close();//Don't put off closing the response
-               //Put this thread to sleep for at least 10 seconds
-               long timeToSleep = Math.abs(limitResetsAt - (System.currentTimeMillis()/1000)) + 10;
-               Thread.sleep(timeToSleep*1000);
+                handleErrorResponse(true, responseCode, httpResponse, csvRecord, null);
+                long limitResetsAt = Long.parseLong(httpResponse.getFirstHeader("x-rate-limit-reset").getValue());
+                //Put this thread to sleep for at least 5 seconds
+                long timeToSleep = Math.abs(limitResetsAt - (System.currentTimeMillis()/1000)) + 5;
+                Thread.sleep(timeToSleep*1000);
             }
             else if (responseCode != 200){//Non-success
-                handleErrorResponse(responseCode, httpResponse, csvRecord, "");
+                handleErrorResponse(false, responseCode, httpResponse, csvRecord, "");
             }
             else
                 successCount.getAndIncrement();
             if (successCount.get()!=0 && successCount.get()%100==0)System.out.print(".");
         } catch(Exception e){//Issue with the connection. Let's not lose the consumer thread
-            handleErrorResponse(400, httpResponse, csvRecord, e.getLocalizedMessage());
+            handleErrorResponse(false, 400, httpResponse, csvRecord, e.getLocalizedMessage());
         }finally{
             if (null != httpResponse)
                 httpResponse.close();
         }
     }
     
-    void handleErrorResponse(int responseCode, CloseableHttpResponse response, CSVRecord csvRecord, String exceptionMessage)throws IOException{
+    void handleErrorResponse(boolean isRateLimitError, int responseCode, CloseableHttpResponse response, CSVRecord csvRecord, String exceptionMessage)throws IOException{
         String errorCode, errorCause;
         try{
             JSONObject errorJSON = new JSONObject(EntityUtils.toString(response.getEntity()));
@@ -213,10 +214,20 @@ class Producer implements Runnable {
         Map values = csvRecord.toMap();
         values.put("errorCode", errorCode);
         values.put("errorCause", errorCause);
-        synchronized(errorRecordPrinter){
-            for (String header : errorHeaders)
-                errorRecordPrinter.print(values.get(header));//Got an error for this row - write it to error file
-            errorRecordPrinter.println();
+        if(isRateLimitError)
+        {
+            synchronized(rateLimitFailurePrinter){
+                for (String header : errorHeaders)
+                    rateLimitFailurePrinter.print(values.get(header));//Got an error for this row - write it to error file
+                rateLimitFailurePrinter.println();
+            }
+        }
+        else{
+            synchronized(errorRecordPrinter){
+                for (String header : errorHeaders)
+                    errorRecordPrinter.print(values.get(header));//Got an error for this row - write it to error file
+                errorRecordPrinter.println();
+            }
         }
         errorCount.getAndIncrement();
     }
