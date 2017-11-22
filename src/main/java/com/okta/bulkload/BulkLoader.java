@@ -52,8 +52,9 @@ public class BulkLoader {
             System.out.println("Error reading configuration. Exiting...");
             System.exit(-1);
         }
-        String errorFile = csvFileArg+"_reject.csv";
-        String rateLimitFile = csvFileArg+"_replay.csv";
+        String filePrefix = csvFileArg.substring(0,csvFileArg.lastIndexOf('.'));	
+        String errorFile = filePrefix+"_reject.csv";
+        String rateLimitFile = filePrefix+"_replay.csv";
         errorHeaders = (configuration.getProperty("csvHeaderRow")+",errorCode,errorCause").split(",");
         int numConsumers = Integer.parseInt(configuration.getProperty("numConsumers", "1"));
         int bufferSize = Integer.parseInt(configuration.getProperty("bufferSize", "10000"));
