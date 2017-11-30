@@ -62,6 +62,8 @@ public class BulkLoader {
         CSVFormat errorFormat = CSVFormat.RFC4180.withDelimiter(',').withQuote('"').withQuoteMode(QuoteMode.ALL).withHeader(errorHeaders);        
         errorRecordPrinter = new CSVPrinter(new FileWriter(errorFile),errorFormat);
         rateLimitFailurePrinter = new CSVPrinter(new FileWriter(rateLimitFile),errorFormat);
+        errorRecordPrinter.flush();
+        rateLimitFailurePrinter.flush();
         
         BlockingQueue myQueue = new LinkedBlockingQueue(bufferSize);
         
